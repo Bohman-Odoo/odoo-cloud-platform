@@ -11,7 +11,7 @@ from contextlib import closing, contextmanager
 import psycopg2
 
 import odoo
-from odoo import _, api, exceptions, models
+from odoo import _, api, exceptions, fields, models
 from odoo.osv.expression import AND, OR, normalize_domain
 from odoo.tools.safe_eval import const_eval
 
@@ -37,6 +37,8 @@ def clean_fs(files):
 
 class IrAttachment(models.Model):
     _inherit = "ir.attachment"
+
+    already_force_storage = fields.Boolean(default=False)
 
     def _register_hook(self):
         super()._register_hook()
@@ -258,7 +260,7 @@ class IrAttachment(models.Model):
         self.ensure_one()
         _logger.info("inspecting attachment %s (%d)", self.name, self.id)
         fname = self.store_fname
-        if fname:
+        if fname and self.datas:
             # migrating from filesystem filestore
             # or from the old 'store_fname' without the bucket name
             _logger.info("moving %s on the object storage", fname)
@@ -279,7 +281,7 @@ class IrAttachment(models.Model):
             self.write({"datas": self.datas})
 
     @api.model
-    def force_storage(self):
+    def force_storage(self, batch_size=0):
         if not self.env["res.users"].browse(self.env.uid)._is_admin():
             raise exceptions.AccessError(
                 _("Only administrators can execute this action.")
@@ -287,7 +289,7 @@ class IrAttachment(models.Model):
         location = self.env.context.get("storage_location") or self._storage()
         if location not in self._get_stores():
             return super().force_storage()
-        self._force_storage_to_object_storage()
+        self._force_storage_to_object_storage(batch_size=batch_size)
 
     @api.model
     def force_storage_to_db_for_special_fields(self, new_cr=False):
@@ -358,7 +360,7 @@ class IrAttachment(models.Model):
                     )
 
     @api.model
-    def _force_storage_to_object_storage(self, new_cr=False):
+    def _force_storage_to_object_storage(self, new_cr=False, batch_size=0):
         _logger.info("migrating files to the object storage")
         storage = self.env.context.get("storage_location") or self._storage()
         # The weird "res_field = False OR res_field != False" domain
@@ -367,6 +369,7 @@ class IrAttachment(models.Model):
         # contain 'res_field'.
         # https://github.com/odoo/odoo/blob/9032617120138848c63b3cfa5d1913c5e5ad76db/odoo/addons/base/ir/ir_attachment.py#L344-L347 # noqa: B950
         domain = [
+            ("already_force_storage", "=", False),
             "!",
             ("store_fname", "=like", "{}://%".format(storage)),
             "|",
@@ -379,7 +382,11 @@ class IrAttachment(models.Model):
         # the installation
         with self.do_in_new_env(new_cr=new_cr) as new_env:
             model_env = new_env["ir.attachment"]
-            ids = model_env.search(domain).ids
+            ids = []
+            if batch_size > 0:
+                ids = model_env.search(domain, limit=batch_size).ids
+            else:
+                ids = model_env.search(domain).ids
             files_to_clean = []
             for attachment_id in ids:
                 try:
@@ -406,6 +413,7 @@ class IrAttachment(models.Model):
                         path = attachment._move_attachment_to_store()
                         if path:
                             files_to_clean.append(path)
+                        attachment.write({"already_force_storage": True})
                 except psycopg2.OperationalError:
                     _logger.error(
                         "Could not migrate attachment %s to S3", attachment_id
